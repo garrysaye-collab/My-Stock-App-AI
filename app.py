@@ -1,35 +1,55 @@
 import streamlit as st
 import pandas as pd
-import yfinance as yf
 import numpy as np
+import yfinance as yf
 import google.generativeai as genai
-import datetime
+from duckduckgo_search import DDGS
+import time
 
 # ==========================================
-# 🔧 1. 系統設定與狀態初始化
+# 🔧 系統設定與狀態初始化
 # ==========================================
-st.set_page_config(page_title="專業量化與 AI 經理人戰情室 (GEM 修復版)", page_icon="🏦", layout="wide")
+st.set_page_config(page_title="專業量化與 AI 經理人戰情室", page_icon="🏦", layout="wide")
 
+# 初始化 Session State (讓資料在對話時不會消失)
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "data_context" not in st.session_state:
     st.session_state.data_context = None
-# 新增一個變數來記住當前的「系統指令 (System Instruction)」，確保 AI 記得它是誰
-if "current_system_instruction" not in st.session_state:
-    st.session_state.current_system_instruction = ""
 
 # ==========================================
-# 📈 2. 核心量化函數 (純數學運算)
+# 🕵️ 核心功能函數 (數據、計算、AI)
 # ==========================================
+def get_verified_data(symbol):
+    symbol = symbol.strip().upper()
+    if not symbol: return None, None, None, "請輸入代號"
+    
+    try:
+        t = yf.Ticker(symbol)
+        df = t.history(period="2y") # 抓兩年確保均線計算
+        if df.empty: return None, None, symbol, "查無數據"
+        
+        # 處理 MultiIndex 欄位 (yfinance 新版常見問題)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        # 抓取公司名稱
+        info = t.info
+        full_name = info.get('longName') or info.get('shortName') or symbol
+        
+        return df, full_name, symbol, None
+    except Exception as e:
+        return None, None, symbol, str(e)
+
 def slope(series, n=3):
-    """計算斜率，判斷趨勢方向"""
     y = series.tail(n).dropna()
     if len(y) < n: return 0
     return np.polyfit(np.arange(len(y)), y, 1)[0]
 
 def detailed_scoring(df):
-    """細緻評分邏輯：將技術指標轉化為 0-10 分"""
+    """細緻評分邏輯"""
     r = df.iloc[-1]
+    prev = df.iloc[-2]
     details = []
     total_score = 0
     
@@ -37,215 +57,158 @@ def detailed_scoring(df):
     rsi_slope = slope(df['RSI'], 3)
     vwap_approx = (r['High'] + r['Low'] + r['Close']) / 3
 
-    # 六大加分檢查項
-    checks = [
-        (r['MA5'] > r['MA10'] > r['MA20'], 3, "均線多頭排列", "MA5>MA10>MA20"),
-        (macd_slope > 0 and r['OSC'] > 0, 2, "MACD 轉強", "DIF斜率>0, OSC>0"),
-        (r['Close'] > vwap_approx, 2, "價格優勢", "收盤價 > VWAP"),
-        (r['Close'] > r['MA20'], 1, "站上月線", "收盤價 > MA20"),
-        (rsi_slope > 0, 1, "RSI 動能", "RSI 斜率 > 0"),
-        (r['Volume'] > df['Volume'].tail(5).mean(), 1, "量能增溫", "今日量 > 5日均量")
-    ]
-    
-    for cond, pts, rule, desc in checks:
-        s = pts if cond else 0
-        details.append({"準則": rule, "條件": desc, "狀態": "✅ 通過" if cond else "❌ 未達成", "得分": s})
-        total_score += s
+    # 1. 均線多頭排列
+    cond1 = r['MA5'] > r['MA10'] > r['MA20']
+    s1 = 3 if cond1 else 0
+    details.append({"準則": "均線多頭排列", "條件": "MA5 > MA10 > MA20", "狀態": "✅ 通過" if cond1 else "❌ 未達成", "得分": s1})
+    total_score += s1
 
-    # 扣分項：波動過大 (風險提示)
+    # 2. MACD 動能
+    cond2 = macd_slope > 0 and r['OSC'] > 0
+    s2 = 2 if cond2 else 0
+    details.append({"準則": "MACD 轉強", "條件": "DIF斜率 > 0 且 OSC > 0", "狀態": "✅ 通過" if cond2 else "❌ 未達成", "得分": s2})
+    total_score += s2
+
+    # 3. 價在均價之上
+    cond3 = r['Close'] > vwap_approx
+    s3 = 2 if cond3 else 0
+    details.append({"準則": "價格優勢", "條件": "收盤價 > VWAP", "狀態": "✅ 通過" if cond3 else "❌ 未達成", "得分": s3})
+    total_score += s3
+
+    # 4. 站上月線
+    cond4 = r['Close'] > r['MA20']
+    s4 = 1 if cond4 else 0
+    details.append({"準則": "站上月線", "條件": "收盤價 > MA20", "狀態": "✅ 通過" if cond4 else "❌ 未達成", "得分": s4})
+    total_score += s4
+
+    # 5. RSI 向上
+    cond5 = rsi_slope > 0
+    s5 = 1 if cond5 else 0
+    details.append({"準則": "RSI 動能", "條件": "RSI 斜率 > 0", "狀態": "✅ 通過" if cond5 else "❌ 未達成", "得分": s5})
+    total_score += s5
+
+    # 6. 量能爆發
+    vol_ma5 = df['Volume'].tail(5).mean()
+    cond6 = r['Volume'] > vol_ma5
+    s6 = 1 if cond6 else 0
+    details.append({"準則": "量能增溫", "條件": "今日量 > 5日均量", "狀態": "✅ 通過" if cond6 else "❌ 未達成", "得分": s6})
+    total_score += s6
+
+    # 7. 扣分項：波動過大
     day_range = r['High'] - r['Low']
-    cond_vol = day_range > 1.8 * r['ATR']
-    s_vol = -2 if cond_vol else 0
-    details.append({"準則": "⚠️ 波動過熱", "條件": ">1.8倍ATR", "狀態": "🚩 觸發" if cond_vol else "⚪ 正常", "得分": s_vol})
-    total_score += s_vol
-    
+    cond7 = day_range > 1.8 * r['ATR']
+    s7 = -2 if cond7 else 0
+    details.append({"準則": "⚠️ 波動過熱", "條件": ">1.8倍 ATR", "狀態": "🚩 觸發扣分" if cond7 else "⚪ 正常", "得分": s7})
+    total_score += s7
+
     return max(0, total_score), pd.DataFrame(details)
 
 def comprehensive_backtest(df):
-    """歷史交易回測：模擬過去兩年的買賣"""
     log = []
-    holding = False; entry_price = 0; entry_date = None
-    
-    for i in range(1, len(df)):
+    holding = False; entry_price = 0; entry_date = None; highest_after_entry = 0
+
+    for i in range(20, len(df)):
         r = df.iloc[i]; prev = df.iloc[i-1]
         curr_date = df.index[i]
 
         if not holding:
-            # 買入訊號：站上月線 + MACD紅柱 + 突破昨日高點
             if r['Close'] > r['MA20'] and r['OSC'] > 0 and r['Close'] > prev['High']:
                 holding = True; entry_price = r['Close']; entry_date = curr_date
+                highest_after_entry = r['Close']
         elif holding:
-            # 賣出訊號：跌破月線 或 RSI 過熱 (>85)
+            highest_after_entry = max(highest_after_entry, r['Close'])
             if r['Close'] < r['MA20'] or r['RSI'] > 85:
                 profit_pct = (r['Close'] - entry_price) / entry_price * 100
                 log.append({
-                    "進場日期": entry_date.date(),
-                    "出場日期": curr_date.date(),
-                    "進場價": round(entry_price, 2),
-                    "出場價": round(r['Close'], 2),
+                    "進場日期": entry_date, "出場日期": curr_date,
+                    "進場價": round(entry_price, 2), "出場價": round(r['Close'], 2),
                     "獲利%": round(profit_pct, 2),
                     "出場原因": "趨勢反轉" if r['Close'] < r['MA20'] else "過熱獲利"
                 })
                 holding = False
     return pd.DataFrame(log)
 
-@st.cache_data(ttl=300)
-def get_verified_data(symbol):
-    """從 Yahoo Finance 下載數據"""
-    symbol = symbol.strip().upper()
-    if symbol.isdigit(): symbol = f"{symbol}.TW"
+def get_ai_response(api_key, messages_history):
+    genai.configure(api_key=api_key)
     try:
-        t = yf.Ticker(symbol)
-        df = t.history(period="2y")
-        if df.empty: return None, None, symbol, "查無數據"
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        
-        info = t.info
-        full_name = info.get('longName') or info.get('shortName') or symbol
-        return df, full_name, symbol, None
+        model = genai.GenerativeModel("gemini-1.5-flash") # 修正 model 名稱
+        gemini_hist = []
+        for m in messages_history:
+            role = "user" if m["role"] == "user" else "model"
+            gemini_hist.append({"role": role, "parts": [m["content"]]})
+        response = model.generate_content(gemini_hist)
+        return response.text
     except Exception as e:
-        return None, None, symbol, str(e)
+        return f"AI 經理人連線錯誤: {str(e)}"
 
 # ==========================================
-# 🧠 3. AI 對話核心 (整合 Google Search 工具)
-# ==========================================
-def chat_with_gemini(api_key, prompt_text, system_instruction):
-    if not api_key: return "⚠️ 請先輸入 API Key。"
-    
-    try:
-        genai.configure(api_key=api_key)
-        
-        # 設定 Google Search 工具 (讓 AI 決定何時聯網)
-        tools_configuration = [
-            {
-                "google_search_retrieval": {
-                    "dynamic_retrieval_config": {
-                        "mode": "dynamic",
-                        "dynamic_threshold": 0.3, 
-                    }
-                }
-            }
-        ]
-        
-        # 模型選擇策略：優先用 2.0-flash，失敗自動降級 1.5-flash
-        model_name = 'gemini-2.0-flash' 
-        
-        try:
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                system_instruction=system_instruction,
-                tools=tools_configuration
-            )
-            chat = model.start_chat(history=[])
-        except:
-            model = genai.GenerativeModel(
-                model_name='gemini-1.5-flash',
-                system_instruction=system_instruction,
-                tools=tools_configuration
-            )
-            chat = model.start_chat(history=[])
-
-        # 重建歷史訊息 (過濾掉系統內部標記)
-        history = []
-        for msg in st.session_state.messages:
-            role = "user" if msg["role"] == "user" else "model"
-            if "【系統數據已載入】" not in msg["content"]: 
-                history.append({"role": role, "parts": [msg["content"]]})
-        
-        chat.history = history
-        
-        # 發送訊息
-        response = chat.send_message(prompt_text)
-        
-        # 處理並顯示搜尋來源
-        final_text = response.text
-        if hasattr(response.candidates[0], 'grounding_metadata') and \
-           response.candidates[0].grounding_metadata.search_entry_point:
-            search_html = response.candidates[0].grounding_metadata.search_entry_point.rendered_content
-            final_text += "\n\n🔍 **資料來源與即時驗證：**\n" + search_html
-            
-        return final_text
-
-    except Exception as e:
-        return f"❌ AI 連線錯誤: {str(e)} \n(建議：請在 Streamlit 後台點擊 'Reboot app' 以強制更新環境)"
-
-# ==========================================
-# 🖥️ 4. UI 介面與主邏輯
+# 🖥️ UI 介面與主邏輯
 # ==========================================
 with st.sidebar:
     st.header("🔑 戰情室控制台")
     api_key = st.text_input("Google API Key", type="password")
-    ticker_input = st.text_input("股票代號", value="2330")
+    ticker_input = st.text_input("股票代號", value="2330.TW") # 台股需加 .TW
     run_btn = st.button("啟動全數據掃描", type="primary")
     
     if st.button("🗑️ 清除對話紀錄"):
         st.session_state.messages = []
-        st.session_state.current_system_instruction = ""
         st.rerun()
 
-if run_btn and api_key:
-    with st.spinner(f"正在調閱 {ticker_input} 檔案與聯網數據..."):
-        df, full_name, real_symbol, err = get_verified_data(ticker_input)
-
-        if df is not None:
-            # 計算指標
-            df['MA5'] = df['Close'].rolling(5).mean()
-            df['MA10'] = df['Close'].rolling(10).mean()
-            df['MA20'] = df['Close'].rolling(20).mean()
-            df['DIF'] = df['Close'].ewm(span=12).mean() - df['Close'].ewm(span=26).mean()
-            df['MACD'] = df['DIF'].ewm(span=9).mean()
-            df['OSC'] = df['DIF'] - df['MACD']
-            df['ATR'] = (df['High'] - df['Low']).rolling(14).mean()
-            delta = df['Close'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean(); rs = gain / loss.replace(0, np.nan)
-            df['RSI'] = 100 - (100 / (1 + rs))
-
-            score, score_details = detailed_scoring(df)
-            bt_log = comprehensive_backtest(df)
+# --- 1. 執行掃描與分析 ---
+if run_btn:
+    if not api_key:
+        st.error("請先輸入 API Key")
+    else:
+        with st.spinner(f"正在調閱 {ticker_input} 檔案與聯網數據..."):
+            df, full_name, real_symbol, err = get_verified_data(ticker_input)
             
-            # --- 關鍵修改：將數據放入 System Instruction，而非直接搜尋 ---
-            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # 建立 AI 的角色設定 (包含量化數據背景)
-            st.session_state.current_system_instruction = f"""
-            現在時間：{current_time}。
-            你是一群專業的股票基金經理人，具備 Google Search 最高權限。
-            
-            【當前分析標的數據】
-            - 股票：{full_name} ({real_symbol})
-            - 量化動能得分：{score}/10
-            - 指標詳情：{score_details.to_string()}
-            - 歷史回測(2年)：勝率 {((len(bt_log[bt_log['獲利%']>0])/len(bt_log)*100) if not bt_log.empty else 0):.1f}%，總報酬 {bt_log['獲利%'].sum() if not bt_log.empty else 0:.1f}%
+            if df is not None:
+                # 技術指標計算
+                df['MA5'] = df['Close'].rolling(5).mean()
+                df['MA10'] = df['Close'].rolling(10).mean()
+                df['MA20'] = df['Close'].rolling(20).mean()
+                df['DIF'] = df['Close'].ewm(span=12).mean() - df['Close'].ewm(span=26).mean()
+                df['MACD'] = df['DIF'].ewm(span=9).mean()
+                df['OSC'] = df['DIF'] - df['MACD']
+                df['ATR'] = (df['High'] - df['Low']).rolling(14).mean()
+                delta = df['Close'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                rs = gain / loss.replace(0, np.nan)
+                df['RSI'] = 100 - (100 / (1 + rs))
 
-            【你的任務】
-            1. **獨立辯證**：量化數據僅供參考。請主動搜尋是否有高配息、併購或產業轉機新聞被忽略。
-            2. **多空對立**：呈現「基本面(多)」vs「技術籌碼(空)」的對點。
-            3. **強制聯網**：回答前必須使用 Google Search 工具搜尋該股的「最新財報 EPS」、「最新股息」及「本月重大新聞」。
-            4. **總結**：最後以巴菲特口吻給出結論。
-            """
+                score, score_details = detailed_scoring(df)
+                bt_log = comprehensive_backtest(df)
+                
+                # 聯網搜尋 (模擬經理人收集情報)
+                try:
+                    with DDGS() as ddgs:
+                        news = list(ddgs.text(f"{full_name} {real_symbol} 財報展望 2026", max_results=3))
+                    news_text = "\n".join([f"- {n['title']}: {n['body']}" for n in news])
+                except:
+                    news_text = "聯網搜尋暫時不可用。"
 
-            # 第一次觸發 AI
-            initial_prompt = f"請根據上述量化數據，並立刻搜尋 {full_name} 的最新基本面新聞，開始第一輪深度多空辯證分析。"
+                system_prompt = f"""你是一群專業投資經理人(總經分析、暗黑操盤手、巴菲特)。
+                標的：{full_name} ({real_symbol})
+                量化得分：{score}分。
+                歷史勝率：{(len(bt_log[bt_log['獲利%']>0])/len(bt_log)*100) if not bt_log.empty else 0:.1f}%。
+                即時新聞：{news_text}
+                請給出深度辯證報告。"""
 
-            response_text = chat_with_gemini(
-                api_key, 
-                initial_prompt, 
-                st.session_state.current_system_instruction
-            )
-            
-            st.session_state.data_context = {
-                "df": df, "name": full_name, "symbol": real_symbol,
-                "score": score, "score_details": score_details, "bt_log": bt_log
-            }
-            # 存入對話紀錄
-            st.session_state.messages = [
-                {"role": "user", "content": f"📊 【系統數據已載入】分析 {full_name} ({real_symbol})"},
-                {"role": "assistant", "content": response_text}
-            ]
-        else:
-            st.error(err)
+                initial_response = get_ai_response(api_key, [{"role": "user", "content": system_prompt}])
+                
+                st.session_state.data_context = {
+                    "df": df, "name": full_name, "symbol": real_symbol,
+                    "score": score, "score_details": score_details, "bt_log": bt_log
+                }
+                st.session_state.messages = [
+                    {"role": "user", "content": system_prompt},
+                    {"role": "assistant", "content": initial_response}
+                ]
+            else:
+                st.error(err)
 
-# --- 顯示儀表板 ---
+# --- 2. 顯示儀表板 ---
 if st.session_state.data_context:
     ctx = st.session_state.data_context
     st.title(f"🏛️ {ctx['name']} ({ctx['symbol']}) 戰情室")
@@ -254,41 +217,32 @@ if st.session_state.data_context:
     with c1:
         st.subheader("🎯 量化評分")
         st.metric("核心動能總分", f"{ctx['score']} / 10")
-        st.dataframe(ctx['score_details'], use_container_width=True)
-    
+        st.table(ctx['score_details'])
     with c2:
-        st.subheader("📈 價格走勢 (120D)")
-        st.line_chart(ctx['df'][['Close', 'MA20']].tail(120))
+        st.subheader("📈 價格走勢")
+        st.line_chart(ctx['df'][['Close', 'MA20']].tail(100))
 
-    with st.expander("📜 查看歷史回測日誌"):
-        if not ctx['bt_log'].empty:
-            st.dataframe(ctx['bt_log'], use_container_width=True)
-        else:
-            st.write("無交易紀錄")
+    st.subheader("📜 歷史回測日誌")
+    if not ctx['bt_log'].empty:
+        st.dataframe(ctx['bt_log'], use_container_width=True)
+    else:
+        st.info("過去兩年內未觸發完整交易訊號。")
         
     st.divider()
-    st.subheader("💬 專家經理人對話")
-    
-    # 對話顯示區
+
+    # --- 3. 對話區域 ---
+    st.subheader("💬 與經理人團隊對話")
     for msg in st.session_state.messages:
+        if "你是一群專業投資經理人" in msg['content']: continue
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if prompt := st.chat_input("詢問更多細節 (如：外資看法、風險點)..."):
-        # 顯示用戶輸入
-        with st.chat_message("user"): st.markdown(prompt)
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        # AI 回答
+    if chat_input := st.chat_input("詢問專家意見..."):
+        st.session_state.messages.append({"role": "user", "content": chat_input})
+        with st.chat_message("user"): st.markdown(chat_input)
         with st.chat_message("assistant"):
-            with st.spinner("經理人正在查閱資料與思考..."):
-                response = chat_with_gemini(
-                    api_key, 
-                    prompt, 
-                    st.session_state.current_system_instruction
-                )
-                st.markdown(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
-
+            response = get_ai_response(api_key, st.session_state.messages)
+            st.markdown(response)
+        st.session_state.messages.append({"role": "assistant", "content": response})
 elif not run_btn:
-    st.info("👈 請在左側輸入代號並啟動掃描")
+    st.info("👈 請在左側輸入代號並點擊「啟動全數據掃描」")
