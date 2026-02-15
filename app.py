@@ -108,7 +108,7 @@ def get_ai_response(api_key, messages_history):
     """
     處理對話請求：
     1. 自動偵測使用者 API Key 支援的最新模型 (解決 404 問題)
-    2. 啟用 Google Search Grounding
+    2. 啟用 Google Search Grounding (原生工具)
     3. 強制注入 GEM 架構 (獨立辯證/兩方對立/暗黑兵法/巴菲特裁定)
     """
     genai.configure(api_key=api_key)
@@ -128,11 +128,10 @@ def get_ai_response(api_key, messages_history):
     4. **巴菲特裁定**：最後由巴菲特决定是否參與，並預估投資效益。
 
     【聯網要求】
-    每次對話前，請**自主搜尋**該股的最新股息率、PE位階及最近一個月的重大新聞，用搜尋到的真實數字說話。不要重複用戶給出的文字。
+    每次對話前，請**自主使用 Google Search 工具搜尋**該股的最新股息率、PE位階及最近一個月的重大新聞，用搜尋到的真實數字說話。不要重複用戶給出的文字。
     """
 
     # 3. 自動選擇模型 (Model Selection Logic)
-    # 這是為了適應擁有 Gemini 2.0 權限但沒有 1.5 權限的特殊帳號
     try:
         # 列出所有可用模型
         available_models = []
@@ -243,7 +242,7 @@ if run_btn and api_key:
             - 策略勝率: {(len(bt_log[bt_log['獲利%']>0])/len(bt_log)*100) if not bt_log.empty else 0:.1f}%
             - 累計報酬: {bt_log['獲利%'].sum() if not bt_log.empty else 0:.1f}%
             
-            請開始分析。記住：請立刻使用 Google Search 搜尋該公司的「最新財報」、「最新股息」與「產業新聞」，若技術面回測數據不佳，請仔細檢查是否為錯殺或價值浮現。
+            請根據上述「技術與量化數據」，並立刻使用你的 Google Search 工具查詢該公司的「最新財報」、「最新股息」與「產業新聞」，開始第一輪的多空辯證分析。
             """
 
             # 呼叫 AI 產生第一份報告 (AI 會在這裡觸發搜尋)
