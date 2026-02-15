@@ -8,7 +8,7 @@ import datetime
 # ==========================================
 # 🔧 系統設定與狀態初始化
 # ==========================================
-st.set_page_config(page_title="專業量化與 AI 經理人戰情室", page_icon="🏦", layout="wide")
+st.set_page_config(page_title="專業量化與 AI 經理人戰情室 (GEM 架構版)", page_icon="🏦", layout="wide")
 
 # 初始化 Session State
 if "messages" not in st.session_state:
@@ -17,7 +17,7 @@ if "data_context" not in st.session_state:
     st.session_state.data_context = None
 
 # ==========================================
-# 🕵️ 核心功能函數 (數據、計算、AI)
+# 🕵️ 核心功能函數 (數據、計算)
 # ==========================================
 def get_verified_data(symbol):
     symbol = symbol.strip().upper()
@@ -101,66 +101,105 @@ def comprehensive_backtest(df):
                 holding = False
     return pd.DataFrame(log)
 
+# ==========================================
+# 🤖 AI 智能核心 (GEM 架構 + 自動模型適配)
+# ==========================================
 def get_ai_response(api_key, messages_history):
     """
-    處理對話請求：啟用 Google Search Grounding 與 動態時間注入
+    處理對話請求：
+    1. 自動偵測使用者 API Key 支援的最新模型 (解決 404 問題)
+    2. 啟用 Google Search Grounding
+    3. 強制注入 GEM 架構 (獨立辯證/兩方對立/暗黑兵法/巴菲特裁定)
     """
     genai.configure(api_key=api_key)
     
-    # 1. 獲取精確的當前時間，強制對齊時間軸
+    # 1. 獲取精確的當前時間
     current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    # 2. 定義系統指令 (System Instruction) - 強制聯網與角色扮演
+    # 2. 定義系統指令 (GEM 架構)
     sys_instruction = f"""
     現在時間是：{current_time}。
-    你是【全能基金經理人團隊】，包含：
-    1. 總經分析師 (關注宏觀、利率、地緣政治)
-    2. 暗黑操盤手 (關注籌碼、騙線、養套殺)
-    3. 巴菲特 (關注護城河、現金流、價值)
+    你們是一群專業的股票基金經理人，具備使用 Google Search 查閱即時資訊、新聞、財報與宏觀經濟的最高權限。
 
-    【最高指令】：
-    - 你擁有 Google Search 工具。針對用戶的每個問題，必須**優先使用工具**查閱該股票的「最新股價」、「最新新聞 (24小時內)」與「最新財報」。
-    - **嚴禁**使用你訓練資料中的舊數據來回答關於「現價」、「本益比」或「近期趨勢」的問題。
-    - 如果回測數據 (用戶提供) 與即時新聞 (你搜尋到的) 衝突，以**即時新聞**為準，並指出市場是否發生了結構性改變。
-    - 回答風格：激烈辯證，數據說話，最後由巴菲特給出結論。
+    【性格與流程】
+    1. **獨立辯證**：用戶提供的「歷史回測數據」僅是參考。如果回測數據慘淡，不要直接判死刑，請**主動搜尋**該標的是否有『高額配息』、『資產重組』或『產業護城河』被忽視了。
+    2. **兩方對立**：必須給出多方（價值/基本面）與空方（技術/籌碼）的激烈碰撞。
+    3. **暗黑兵法**：莊家團隊須以寓言方式揭示市場陷阱（例如：回測止損可能是為了收割散戶恐慌盤）。
+    4. **巴菲特裁定**：最後由巴菲特决定是否參與，並預估投資效益。
+
+    【聯網要求】
+    每次對話前，請**自主搜尋**該股的最新股息率、PE位階及最近一個月的重大新聞，用搜尋到的真實數字說話。不要重複用戶給出的文字。
     """
 
+    # 3. 自動選擇模型 (Model Selection Logic)
+    # 這是為了適應擁有 Gemini 2.0 權限但沒有 1.5 權限的特殊帳號
     try:
-        # 3. 初始化模型時啟用 Search 工具 (建議使用 gemini-1.5-pro 以獲得最佳搜尋推理能力)
+        # 列出所有可用模型
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name.replace("models/", ""))
+        
+        # 優先級清單 (從最新最強的開始嘗試)
+        priority_list = [
+            "gemini-2.0-flash-exp",   # 最新 2.0 Flash 實驗版
+            "gemini-2.0-pro-exp",     # 最新 2.0 Pro 實驗版
+            "gemini-exp-1206",        # 特定實驗版
+            "gemini-1.5-pro",         # 1.5 Pro
+            "gemini-1.5-flash"        # 1.5 Flash
+        ]
+        
+        selected_model = None
+        
+        # 嘗試匹配優先級清單
+        for p_model in priority_list:
+            if p_model in available_models:
+                selected_model = p_model
+                break
+        
+        # 如果都沒匹配到，就選列表中的第一個可用模型作為備案
+        if not selected_model and available_models:
+            selected_model = available_models[0]
+            
+        if not selected_model:
+            return "❌ 錯誤：無法在您的 API Key 中找到任何支援 generateContent 的模型。"
+
+        # 4. 初始化模型 (啟用 Search 工具)
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-pro", 
+            model_name=selected_model, 
             tools='google_search_retrieval', 
             system_instruction=sys_instruction
         )
 
-        # 4. 轉換對話歷史
+        # 5. 轉換對話歷史
         gemini_hist = []
         for m in messages_history:
             role = "user" if m["role"] == "user" else "model"
             gemini_hist.append({"role": role, "parts": [str(m["content"])]})
             
-        # 5. 生成回應 (啟用自動搜尋)
+        # 6. 生成回應
         response = model.generate_content(gemini_hist)
         
-        # 6. 解析回應 (包含搜尋來源引用)
+        # 7. 解析回應 (包含搜尋來源引用)
         final_text = response.text
         
         # 檢查是否有 Grounding Metadata (搜尋來源)
-        if response.candidates[0].grounding_metadata.search_entry_point:
+        if hasattr(response.candidates[0], 'grounding_metadata') and \
+           response.candidates[0].grounding_metadata.search_entry_point:
             search_html = response.candidates[0].grounding_metadata.search_entry_point.rendered_content
-            final_text += "\n\n" + "🔍 **資料來源與即時驗證：**\n" + search_html
+            final_text += f"\n\n🔍 **資料來源與即時驗證 (Model: {selected_model})：**\n" + search_html
         
         return final_text
 
     except Exception as e:
-        return f"AI 經理人連線或搜尋錯誤: {str(e)}\n(請確認 API Key 是否有效，並支援 Google Search Grounding)"
+        return f"⚠️ AI 執行錯誤 (嘗試使用模型: {selected_model if 'selected_model' in locals() else 'Unknown'}): {str(e)}\n請檢查您的 API Key 是否支援 Google Search 工具。"
 
 # ==========================================
 # 🖥️ UI 介面與主邏輯
 # ==========================================
 with st.sidebar:
     st.header("🔑 戰情室控制台")
-    api_key = st.text_input("Google API Key", type="password")
+    api_key = st.text_input("Google API Key (支援 Gemini 2.0+)", type="password")
     ticker_input = st.text_input("股票代號", value="2330")
     run_btn = st.button("啟動全數據掃描", type="primary")
     
@@ -190,8 +229,6 @@ if run_btn and api_key:
             score, score_details = detailed_scoring(df)
             bt_log = comprehensive_backtest(df)
             
-            # --- 重點修改：這裡不再使用 DDGS，而是準備純數據給 AI ---
-            
             # 構建初始 Prompt (只提供技術面數據，要求 AI 自己去查基本面)
             initial_data_prompt = f"""
             【量化技術面數據輸入】
@@ -206,7 +243,7 @@ if run_btn and api_key:
             - 策略勝率: {(len(bt_log[bt_log['獲利%']>0])/len(bt_log)*100) if not bt_log.empty else 0:.1f}%
             - 累計報酬: {bt_log['獲利%'].sum() if not bt_log.empty else 0:.1f}%
             
-            請根據上述「技術與量化數據」，並立刻使用你的 Google Search 工具查詢該公司的「最新財報」、「除權息消息」與「產業新聞」，開始第一輪的多空辯證分析。
+            請開始分析。記住：請立刻使用 Google Search 搜尋該公司的「最新財報」、「最新股息」與「產業新聞」，若技術面回測數據不佳，請仔細檢查是否為錯殺或價值浮現。
             """
 
             # 呼叫 AI 產生第一份報告 (AI 會在這裡觸發搜尋)
