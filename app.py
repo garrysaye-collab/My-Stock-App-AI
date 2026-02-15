@@ -7,230 +7,146 @@ from duckduckgo_search import DDGS
 import time
 
 # ==========================================
-# 🔧 設定頁面
+# 🔧 核心設定
 # ==========================================
-st.set_page_config(page_title="全球股市 AI 戰情室 (Gemini 2.5 版)", page_icon="📡", layout="wide")
+st.set_page_config(page_title="股市動能掃描 AI (經理人版)", page_icon="📈", layout="wide")
 
-# 初始化 Session State
+# 初始化 Session State 用於對話紀錄
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "stock_cache" not in st.session_state:
-    st.session_state.stock_cache = None
 
 # ==========================================
-# 🌐 網路搜尋功能 (DuckDuckGo)
+# 🌐 聯網搜尋與 AI 分析 (大腦)
 # ==========================================
-def search_web(keyword, max_results=5):
-    """使用 DuckDuckGo 搜尋即時財經新聞"""
+def search_latest_news(ticker_name):
+    """自主搜尋最新股息、PE與重大新聞"""
     try:
-        results = []
-        # 使用 context manager 確保資源釋放
         with DDGS() as ddgs:
-            search_query = f"{keyword} stock news finance"
-            # 搜尋並獲取結果
-            ddgs_gen = ddgs.text(search_query, max_results=max_results)
-            for r in ddgs_gen:
-                results.append(f"標題: {r['title']}\n連結: {r['href']}\n摘要: {r['body']}")
-        
-        return "\n\n".join(results) if results else "查無相關即時新聞。"
-    except Exception as e:
-        print(f"搜尋錯誤: {e}")
-        return "⚠️ 搜尋功能暫時受限 (請稍後再試)。"
+            # 針對股息、PE、新聞進行三位一體搜尋
+            query = f"{ticker_name} dividend yield PE ratio news 2026"
+            results = [f"內容: {r['body']}" for r in ddgs.text(query, max_results=6)]
+        return "\n".join(results)
+    except:
+        return "暫時無法取得即時聯網數據，將以基本面資料進行分析。"
 
-# ==========================================
-# 📊 數據獲取與計算
-# ==========================================
-def calculate_technical_indicators(df):
-    """計算技術指標"""
-    # 均線
-    df['MA5'] = df['Close'].rolling(5).mean()
-    df['MA20'] = df['Close'].rolling(20).mean()
-    df['MA60'] = df['Close'].rolling(60).mean()
-    
-    # MACD
-    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['DIF'] = ema12 - ema26
-    df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    
-    # RSI
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    return df
-
-@st.cache_data(ttl=300)
-def get_stock_data(ticker):
-    """下載股價並獲取公司名稱"""
-    ticker = ticker.strip().upper()
-    
-    # 智慧判斷台股後綴
-    if ticker.isdigit():
-        ticker = f"{ticker}.TW"
-    
-    try:
-        stock = yf.Ticker(ticker)
-        df = stock.history(period="1y")
-        
-        if df.empty:
-            return None, None, "❌ 查無此股票數據，請確認代號 (如: 2330.TW, AAPL)"
-        
-        try:
-            info = stock.info
-            company_name = info.get('longName') or info.get('shortName') or ticker
-        except:
-            company_name = ticker
-
-        df = calculate_technical_indicators(df)
-        return df, {"name": company_name, "ticker": ticker}, None
-        
-    except Exception as e:
-        return None, None, str(e)
-
-# ==========================================
-# 🧠 AI 核心 (使用 Gemini 2.5 Flash)
-# ==========================================
-def chat_with_gemini(api_key, user_input, stock_context, news_context, system_prompt):
-    if not api_key: return "⚠️ 請輸入 Google API Key"
+def chat_with_manager(api_key, user_input, stock_data, backtest_log, search_news):
+    if not api_key: return "⚠️ 請在左側輸入 Google API Key 以啟動 AI 經理人。"
     
     genai.configure(api_key=api_key)
     
+    # 這裡就是您要求的【性格與流程】設定
+    system_instruction = """
+    你是一群專業股票基金經理人。你擁有查閱即時資訊、新聞、財報與宏觀經濟的權限。
+    你的任務是對用戶提供的量化回測數據進行「二次審計」。
+    
+    【性格與流程】
+    1. 獨立辯證：用戶提供的回測數據僅是參考。若數據差，主動從即時新聞中尋找『護城河』或『高配息』等轉機。
+    2. 兩方對立：對話中必須包含「多方(基本面)」與「空方(籌碼/技術面)」的激烈碰撞。
+    3. 暗黑兵法：莊家團隊須以寓言方式揭示市場陷阱（例如：目前的止損訊號是否是莊家在收割散戶）。
+    4. 巴菲特裁定：最後由巴菲特總結，決定是否參與並預估效益。
+    
+    請務必引用搜尋到的真實數字（股息率、PE、新聞日期）來說話。
+    """
+    
     full_prompt = f"""
-    【使用者問題】: {user_input}
+    標的：{user_input}
+    量化指標：{stock_data}
+    回測紀錄：{backtest_log}
+    即時聯網資訊：{search_news}
     
-    【當前股票即時數據】:
-    {stock_context}
-    
-    【網路搜尋到的即時新聞/市場消息】:
-    {news_context}
-    
-    請根據以上真實數據與新聞，進行專業團隊的辯證與分析。
+    請開始你們經理人團隊的辯證。
     """
 
-    # 🔴 關鍵修改：使用您診斷出來的正確模型名稱
-    # 根據您的清單，這是 index 0 的模型
-    model_name = "models/gemini-2.5-flash" 
-    
     try:
-        model = genai.GenerativeModel(model_name, system_instruction=system_prompt)
-        
-        # 加入重試機制，因為 2.5 Flash 是預覽版，可能有頻率限制
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = model.generate_content(full_prompt)
-                return response.text
-            except Exception as e:
-                error_msg = str(e)
-                if "429" in error_msg: # 配額不足
-                    wait_time = 5 * (attempt + 1)
-                    print(f"⚠️ 觸發 API 限制，等待 {wait_time} 秒...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    raise e # 其他錯誤直接拋出
-
+        # 使用您帳號中可用的最新模型
+        model = genai.GenerativeModel("models/gemini-2.5-flash", system_instruction=system_instruction)
+        response = model.generate_content(full_prompt)
+        return response.text
     except Exception as e:
-        return f"❌ AI 分析錯誤 ({model_name}): {str(e)}"
-    
-    return "⚠️ 系統繁忙，請稍後再試。"
+        return f"AI 經理人離線中: {str(e)}"
+
+# ==========================================
+# 📊 量化回測邏輯 (底層)
+# ==========================================
+@st.cache_data(ttl=300)
+def get_data_and_analyze(stock_id):
+    stock_id = stock_id.strip().upper()
+    if stock_id.isdigit(): stock_id = f"{stock_id}.TW"
+    elif not any(suffix in stock_id for suffix in [".TW", ".TWO", ".HK", ".US", ".SS", ".SZ"]):
+        if not (stock_id.isalpha() and len(stock_id) <= 4): stock_id = f"{stock_id}.TW"
+    try:
+        df = yf.download(stock_id, period="1y", progress=False)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        if df.empty: return None, stock_id, "查無資料"
+        df['MA20'] = df['Close'].rolling(20).mean()
+        df['MA60'] = df['Close'].rolling(60).mean()
+        # 簡易 RSI 計算
+        delta = df['Close'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean(); rs = gain / loss.replace(0, np.nan)
+        df['RSI'] = 100 - (100 / (1 + rs))
+        return df.dropna(), stock_id, None
+    except Exception as e: return None, stock_id, str(e)
+
+def run_backtest(df):
+    log = []
+    holding = False; entry_price = 0; total_ret = 0
+    for i in range(1, len(df)):
+        r = df.iloc[i]; prev = df.iloc[i-1]
+        if not holding and r['Close'] > r['MA20'] and r['Close'] > prev['High']:
+            holding = True; entry_price = r['Close']
+        elif holding and (r['Close'] < r['MA20'] or r['RSI'] > 80):
+            holding = False; p = (r['Close'] - entry_price) / entry_price * 100
+            total_ret += p
+            log.append({"日期": df.index[i].strftime('%Y-%m-%d'), "獲利%": round(p, 2)})
+    return log, round(total_ret, 2)
 
 # ==========================================
 # 🖥️ UI 介面
 # ==========================================
-st.title("📡 全球股市 AI 戰情室 (Gemini 2.5 核心)")
-st.caption("🚀 使用最新 Google Gemini 2.5 Flash 模型驅動")
+st.title("📡 經理人級別：股市動能戰情室")
 
 with st.sidebar:
-    st.header("⚙️ 設定")
-    api_key = st.text_input("Google API Key", type="password")
-    
-    st.divider()
-    st.markdown("### 🔍 輸入代號")
-    st.text("範例：2330, AAPL, TSLA, 0050")
-    ticker_input = st.text_input("股票代號", value="2330")
-    
-    if st.button("🚀 啟動分析", type="primary"):
-        if not api_key:
-            st.error("請先輸入 API Key！")
+    st.header("🔑 權限驗證")
+    api_key = st.text_input("輸入 Google API Key", type="password")
+    ticker = st.text_input("輸入標的 (如 2330, NVDA)", value="2330")
+    run_btn = st.button("啟動專業分析", type="primary")
+
+if run_btn:
+    with st.spinner("經理人正在查閱即時財報與新聞..."):
+        # 1. 量化回測
+        df, real_id, err = get_data_and_analyze(ticker)
+        if df is not None:
+            backtest_log, total_ret = run_backtest(df)
+            latest = df.iloc[-1]
+            stock_info = f"價格: {latest['Close']:.2f}, RSI: {latest['RSI']:.2f}, MA20: {latest['MA20']:.2f}"
+            
+            # 2. 聯網搜尋 (經理人權限)
+            news_context = search_latest_news(ticker)
+            
+            # 3. 儀表板展示
+            c1, c2 = st.columns(2)
+            c1.metric("量化回測累計報酬", f"{total_ret}%")
+            c2.info(f"當前標的: {real_id}")
+            
+            # 4. AI 經理人辯證 (核心)
+            st.divider()
+            st.subheader("🕵️ 經理人團隊辯證報告")
+            
+            analysis_report = chat_with_manager(api_key, real_id, stock_info, backtest_log, news_context)
+            st.markdown(analysis_report)
+            
+            # 保存至對話紀錄
+            st.session_state.messages.append({"role": "assistant", "content": analysis_report})
+            
+            st.line_chart(df['Close'])
         else:
-            st.session_state.messages = [] 
-            st.session_state.stock_cache = None 
-            
-            with st.spinner(f"正在連線交易所與搜尋 {ticker_input} 最新新聞..."):
-                df, info, err = get_stock_data(ticker_input)
-                
-                if df is not None:
-                    # 1. 搜尋網路新聞
-                    news_text = search_web(f"{info['name']} {info['ticker']}")
-                    
-                    # 2. 整理數據文本
-                    latest = df.iloc[-1]
-                    stock_context_str = f"""
-                    股票: {info['name']} ({info['ticker']})
-                    收盤價: {latest['Close']:.2f}
-                    MA5: {latest['MA5']:.2f} | MA20: {latest['MA20']:.2f} | MA60: {latest['MA60']:.2f}
-                    RSI: {latest['RSI']:.2f} | MACD: {latest['MACD']:.2f}
-                    """
-                    
-                    # 3. 存入 Session
-                    st.session_state.stock_cache = {
-                        "df": df,
-                        "info": info,
-                        "news": news_text,
-                        "context_str": stock_context_str
-                    }
-                    
-                    # 4. 觸發 AI 第一句話
-                    initial_prompt = "請根據傳入的數據與新聞，對這檔股票進行一次完整的「莊家團隊」多角度分析。"
-                    
-                    system_instruction = """
-                    你是一個由「總體經濟師、技術分析師、莊家操盤手、巴菲特」組成的投資團隊。
-                    請引用新聞並用陰謀論視角解讀，最後給出明確操作建議。
-                    """
-                    
-                    ai_reply = chat_with_gemini(api_key, initial_prompt, stock_context_str, news_text, system_instruction)
-                    st.session_state.messages.append({"role": "assistant", "content": ai_reply})
-                    
-                else:
-                    st.error(err)
+            st.error(err)
 
-# === 主要顯示區 ===
-
-if st.session_state.stock_cache:
-    cache = st.session_state.stock_cache
-    df = cache['df']
-    info = cache['info']
-    
-    # 顯示基本資訊
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        st.metric(f"{info['name']}", f"{df.iloc[-1]['Close']:.2f}", f"{df.iloc[-1]['Close'] - df.iloc[-2]['Close']:.2f}")
-    with col2:
-        st.info(f"📰 **已獲取最新網路情報**：\n{cache['news'][:150]}...")
-
-    # 顯示圖表
-    st.line_chart(df['Close'])
-
-    # 對話區
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    # 使用者輸入
-    if user_input := st.chat_input("追問 AI (例如：這則新聞對明天股價有什麼影響？)"):
-        st.chat_message("user").markdown(user_input)
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        
-        with st.spinner("AI 團隊正在根據新聞辯證中..."):
-            system_instruction = "你是一個專業股票分析團隊，請根據已有的數據與新聞回答用戶問題。"
-            response = chat_with_gemini(api_key, user_input, cache['context_str'], cache['news'], system_instruction)
-            
-            st.chat_message("assistant").markdown(response)
-            st.session_state.messages.append({"role": "assistant", "content": response})
-
-else:
-    st.info("👈 請在左側輸入 API Key 與 股票代號並點擊「啟動分析」")
+# 追問功能
+if st.session_state.messages:
+    if prompt := st.chat_input("對經理人團隊進一步質詢..."):
+        st.chat_message("user").write(prompt)
+        with st.spinner("團隊討論中..."):
+            # 這裡簡單簡化，實際可帶入更多上下文
+            res = chat_with_manager(api_key, prompt, "續前數據", "續前紀錄", "重新搜尋中...")
+            st.chat_message("assistant").write(res)
