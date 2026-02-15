@@ -3,13 +3,13 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 import google.generativeai as genai
-from duckduckgo_search import DDGS  # 引入搜尋功能
-import time
+from duckduckgo_search import DDGS
+import time  # 引入時間模組，用於處理 API 冷卻時間
 
 # ==========================================
 # 🔧 設定頁面
 # ==========================================
-st.set_page_config(page_title="全球股市 AI 戰情室", page_icon="📡", layout="wide")
+st.set_page_config(page_title="全球股市 AI 戰情室 (修復版)", page_icon="📡", layout="wide")
 
 # 初始化 Session State
 if "messages" not in st.session_state:
@@ -18,33 +18,27 @@ if "stock_cache" not in st.session_state:
     st.session_state.stock_cache = None
 
 # ==========================================
-# 🌐 網路搜尋功能 (解決無法查詢外部資訊問題)
+# 🌐 網路搜尋功能
 # ==========================================
 def search_web(keyword, max_results=5):
     """使用 DuckDuckGo 搜尋即時財經新聞"""
     try:
         results = []
         with DDGS() as ddgs:
-            # 搜尋關鍵字加上 "stock news" 或 "股價新聞" 以提高精準度
+            # 搜尋關鍵字加上 "stock news finance" 以提高精準度
             search_query = f"{keyword} stock news finance"
+            # 為了避免搜尋頻率過高被擋，簡單的 try-catch 保護
             ddgs_gen = ddgs.text(search_query, max_results=max_results)
             for r in ddgs_gen:
                 results.append(f"標題: {r['title']}\n連結: {r['href']}\n摘要: {r['body']}")
         
         return "\n\n".join(results) if results else "查無相關即時新聞。"
     except Exception as e:
-        return f"搜尋功能暫時無法使用: {str(e)}"
+        return f"搜尋功能暫時無法使用 (可能是頻率限制): {str(e)}"
 
 # ==========================================
 # 📊 數據獲取與計算
 # ==========================================
-def slope(series, n=3):
-    y = series.tail(n).dropna()
-    if len(y) < n: return 0
-    x = np.arange(len(y))
-    try: return np.polyfit(x, y, 1)[0]
-    except: return 0
-
 def calculate_technical_indicators(df):
     """計算技術指標"""
     # 均線
@@ -78,8 +72,7 @@ def get_stock_data(ticker):
     """下載股價並獲取公司名稱"""
     ticker = ticker.strip().upper()
     
-    # 智慧判斷後綴 (解決 600900.SS 錯誤問題)
-    # 如果純數字，預設為台股，除非使用者自己輸入了後綴
+    # 智慧判斷後綴
     if ticker.isdigit():
         ticker = f"{ticker}.TW"
     
@@ -106,39 +99,64 @@ def get_stock_data(ticker):
         return None, None, str(e)
 
 # ==========================================
-# 🧠 AI 核心
+# 🧠 AI 核心 (已修復 429 錯誤)
 # ==========================================
 def chat_with_gemini(api_key, user_input, stock_context, news_context, system_prompt):
     if not api_key: return "⚠️ 請輸入 Google API Key"
     
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash', system_instruction=system_prompt) 
-        # 註: 建議使用 gemini-2.0-flash 或 1.5-flash 速度較快
         
-        # 構建包含「即時數據」與「新聞」的完整 Prompt
+        # 🟢 修正重點 1: 改用 gemini-1.5-flash (穩定且免費額度較高)
+        # 如果您有付費，可改用 gemini-1.5-pro
+        model_name = 'gemini-1.5-flash'
+        
+        model = genai.GenerativeModel(model_name, system_instruction=system_prompt)
+        
         full_prompt = f"""
         【使用者問題】: {user_input}
         
         【當前股票即時數據】:
         {stock_context}
         
-        【網路搜尋到的即時新聞/市場消息】(這是真實的外部資訊，請依此分析):
+        【網路搜尋到的即時新聞/市場消息】:
         {news_context}
         
         請根據以上真實數據與新聞，進行專業團隊的辯證與分析。
         """
         
-        response = model.generate_content(full_prompt)
-        return response.text
+        # 🟢 修正重點 2: 加入自動重試機制 (Retry Logic)
+        max_retries = 3
+        retry_delay = 5  # 基礎等待秒數
+        
+        for attempt in range(max_retries):
+            try:
+                response = model.generate_content(full_prompt)
+                return response.text
+            except Exception as e:
+                error_msg = str(e)
+                # 偵測 429 Resource Exhausted 錯誤
+                if "429" in error_msg or "quota" in error_msg.lower():
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        # 在終端機印出等待訊息 (方便除錯)
+                        print(f"⚠️ 觸發 API 速率限制，正在等待 {wait_time} 秒後重試...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        return "⚠️ Google API 免費額度已達上限 (429 Error)。請稍後再試，或更換 API Key。"
+                else:
+                    # 其他錯誤直接回傳
+                    return f"❌ AI 發生錯誤: {error_msg}"
+                    
     except Exception as e:
-        return f"❌ AI 發生錯誤: {str(e)}"
+        return f"❌ 系統錯誤: {str(e)}"
 
 # ==========================================
 # 🖥️ UI 介面
 # ==========================================
 st.title("📡 全球股市 AI 戰情室 (聯網版)")
-st.caption("結合 yfinance 數據 + DuckDuckGo 即時新聞搜尋 + Gemini AI 分析")
+st.caption("結合 yfinance 數據 + DuckDuckGo 即時新聞 + Gemini 1.5 Flash")
 
 with st.sidebar:
     st.header("⚙️ 設定")
@@ -148,54 +166,58 @@ with st.sidebar:
     st.divider()
     st.subheader("🔍 股票代號範例")
     st.code("台積電: 2330\n工行: 600900.SS\n蘋果: AAPL\n騰訊: 0700.HK")
-    ticker_input = st.text_input("輸入代號", value="600900.SS")
+    ticker_input = st.text_input("輸入代號", value="2330")
     
     if st.button("🚀 啟動分析", type="primary"):
-        st.session_state.messages = [] # 清空舊對話
-        with st.spinner(f"正在連線交易所與搜尋 {ticker_input} 最新新聞..."):
-            df, info, err = get_stock_data(ticker_input)
+        if not api_key:
+            st.error("請先輸入 API Key！")
+        else:
+            st.session_state.messages = [] # 清空舊對話
+            st.session_state.stock_cache = None # 清空舊數據
             
-            if df is not None:
-                # 1. 搜尋網路新聞
-                news_text = search_web(f"{info['name']} {info['ticker']}")
+            with st.spinner(f"正在連線交易所與搜尋 {ticker_input} 最新新聞..."):
+                df, info, err = get_stock_data(ticker_input)
                 
-                # 2. 整理數據文本
-                latest = df.iloc[-1]
-                stock_context_str = f"""
-                股票: {info['name']} ({info['ticker']})
-                幣別: {info['currency']}
-                收盤價: {latest['Close']:.2f}
-                MA5: {latest['MA5']:.2f} | MA20: {latest['MA20']:.2f} | MA60: {latest['MA60']:.2f}
-                RSI: {latest['RSI']:.2f} | MACD: {latest['MACD']:.2f}
-                """
-                
-                # 3. 存入 Session
-                st.session_state.stock_cache = {
-                    "df": df,
-                    "info": info,
-                    "news": news_text,
-                    "context_str": stock_context_str
-                }
-                
-                # 4. 觸發 AI 第一句話
-                initial_prompt = "請根據傳入的數據與新聞，對這檔股票進行一次完整的「莊家團隊」多角度分析。"
-                
-                # 系統 Prompt 設定
-                system_instruction = """
-                你是一個由「總體經濟師、技術分析師、量化專家、莊家操盤手、巴菲特」組成的投資團隊。
-                
-                重要規則：
-                1. 必須基於提供的【即時數據】和【網路新聞】進行分析，不要捏造數據。
-                2. 如果新聞中提到具體的利好或利空（如財報、政策、收購），請務必引用並納入分析。
-                3. 「莊家操盤手」需用陰謀論視角解讀新聞（例如：這是為了出貨發布的假利好）。
-                4. 最後由「巴菲特」給出買入、觀望或賣出的明確建議。
-                """
-                
-                ai_reply = chat_with_gemini(api_key, initial_prompt, stock_context_str, news_text, system_instruction)
-                st.session_state.messages.append({"role": "assistant", "content": ai_reply})
-                
-            else:
-                st.error(err)
+                if df is not None:
+                    # 1. 搜尋網路新聞
+                    news_text = search_web(f"{info['name']} {info['ticker']}")
+                    
+                    # 2. 整理數據文本
+                    latest = df.iloc[-1]
+                    stock_context_str = f"""
+                    股票: {info['name']} ({info['ticker']})
+                    幣別: {info['currency']}
+                    收盤價: {latest['Close']:.2f}
+                    MA5: {latest['MA5']:.2f} | MA20: {latest['MA20']:.2f} | MA60: {latest['MA60']:.2f}
+                    RSI: {latest['RSI']:.2f} | MACD: {latest['MACD']:.2f}
+                    """
+                    
+                    # 3. 存入 Session
+                    st.session_state.stock_cache = {
+                        "df": df,
+                        "info": info,
+                        "news": news_text,
+                        "context_str": stock_context_str
+                    }
+                    
+                    # 4. 觸發 AI 第一句話
+                    initial_prompt = "請根據傳入的數據與新聞，對這檔股票進行一次完整的「莊家團隊」多角度分析。"
+                    
+                    system_instruction = """
+                    你是一個由「總體經濟師、技術分析師、量化專家、莊家操盤手、巴菲特」組成的投資團隊。
+                    
+                    重要規則：
+                    1. 必須基於提供的【即時數據】和【網路新聞】進行分析，不要捏造數據。
+                    2. 如果新聞中提到具體的利好或利空（如財報、政策、收購），請務必引用並納入分析。
+                    3. 「莊家操盤手」需用陰謀論視角解讀新聞（例如：這是為了出貨發布的假利好）。
+                    4. 最後由「巴菲特」給出買入、觀望或賣出的明確建議。
+                    """
+                    
+                    ai_reply = chat_with_gemini(api_key, initial_prompt, stock_context_str, news_text, system_instruction)
+                    st.session_state.messages.append({"role": "assistant", "content": ai_reply})
+                    
+                else:
+                    st.error(err)
 
 # === 主要顯示區 ===
 
