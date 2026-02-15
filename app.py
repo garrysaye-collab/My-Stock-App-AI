@@ -10,7 +10,7 @@ import time
 # 🔧 設定頁面與 Session
 # ==========================================
 st.set_page_config(
-    page_title="股票基金大師團隊 AI (穩定版)", 
+    page_title="股票基金大師團隊 AI (終極容錯版)", 
     page_icon="🏦", 
     layout="wide"
 )
@@ -22,6 +22,7 @@ if "backtest_log" not in st.session_state: st.session_state.backtest_log = None
 if "quant_score" not in st.session_state: st.session_state.quant_score = None
 if "score_details" not in st.session_state: st.session_state.score_details = ""
 if "vwap" not in st.session_state: st.session_state.vwap = 0
+if "current_model_name" not in st.session_state: st.session_state.current_model_name = None
 
 # ==========================================
 # 🧮 基礎計算函數
@@ -64,7 +65,6 @@ def get_data_with_indicators(stock_id):
 
         # 指標
         df['MA5'] = df['Close'].rolling(5).mean()
-        df['MA10'] = df['Close'].rolling(10).mean()
         df['MA20'] = df['Close'].rolling(20).mean()
         df['MA60'] = df['Close'].rolling(60).mean()
         
@@ -86,7 +86,6 @@ def get_data_with_indicators(stock_id):
         ema26 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = ema12 - ema26
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
-        df['OSC'] = df['DIF'] - df['MACD']
         
         df['Vol_MA'] = df['Volume'].rolling(5).mean()
 
@@ -103,13 +102,12 @@ def run_backtest(df):
     entry_price = 0
     entry_date = None
     
-    test_data = df.tail(800) # 只測最近幾年以節省資源
+    test_data = df.tail(800) 
     
     for i in range(1, len(test_data)):
         r = test_data.iloc[i]
         curr_date = test_data.index[i]
         
-        # 簡單策略範例：MA20翻揚且RSI強勢
         buy_signal = (r['Close'] > r['MA20']) and (r['RSI'] > 50) and (test_data.iloc[i-1]['Close'] < test_data.iloc[i-1]['MA20'])
         sell_signal = (r['Close'] < r['MA20'])
 
@@ -142,80 +140,106 @@ def calculate_quant_score(df, vwap_val):
     return max(0, min(10, score)), " | ".join(reasons)
 
 # ==========================================
-# 🧠 AI 核心 (針對 429 錯誤的防禦性寫法)
+# 🧠 AI 核心 (針對 404/429 錯誤的自動修復邏輯)
 # ==========================================
 def chat_with_gemini(api_key, prompt_text, system_instruction):
     if not api_key: return "⚠️ 請先輸入 API Key。"
     
-    try:
-        genai.configure(api_key=api_key)
-        
-        # 1. 安全設定全開 (保留個性)
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-        }
+    genai.configure(api_key=api_key)
+    
+    # 1. 安全設定全開
+    safety_settings = {
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    }
 
-        # 2. 處理歷史訊息 (Token 優化：只保留對話，不重複傳送舊數據)
-        history = []
-        for msg in st.session_state.messages:
-            role = "user" if msg["role"] == "user" else "model"
-            # 關鍵過濾：避免每次都傳送龐大的「系統數據」導致 429
-            if "【系統數據】" not in msg["content"]:
-                history.append({"role": role, "parts": [msg["content"]]})
+    # 2. 處理歷史訊息 (Token 優化)
+    history = []
+    for msg in st.session_state.messages:
+        role = "user" if msg["role"] == "user" else "model"
+        if "【系統數據】" not in msg["content"]:
+            history.append({"role": role, "parts": [msg["content"]]})
 
-        # 3. 嘗試使用 1.5 Flash + 搜尋工具 (最穩定)
-        tools_config = [
-            {"google_search_retrieval": {"dynamic_retrieval_config": {"mode": "dynamic", "dynamic_threshold": 0.3}}}
-        ]
-        
+    # 3. 工具設定
+    tools_config = [{"google_search_retrieval": {"dynamic_retrieval_config": {"mode": "dynamic", "dynamic_threshold": 0.3}}}]
+    
+    # ==========================================
+    # 🚨 關鍵修復：自動尋找可用的模型名稱
+    # ==========================================
+    # 這些是可能存在的模型名稱，系統會依序嘗試，直到成功為止
+    candidate_models = [
+        'gemini-1.5-flash',          # 標準名稱
+        'gemini-1.5-flash-latest',   # 最新別名
+        'gemini-1.5-flash-001',      # 特定版本
+        'gemini-1.5-flash-002',      # 更新版本
+        'gemini-pro'                 # 最後備援 (1.0 pro)
+    ]
+
+    # 如果之前已經找到過能用的模型，優先用它
+    if st.session_state.current_model_name:
+        candidate_models.insert(0, st.session_state.current_model_name)
+
+    last_error = ""
+
+    for model_name in candidate_models:
         try:
+            # 嘗試建立模型
             model = genai.GenerativeModel(
-                model_name='gemini-1.5-flash', # 強制使用 1.5 (配額較多)
+                model_name=model_name,
                 system_instruction=system_instruction,
                 tools=tools_config,
                 safety_settings=safety_settings
             )
             chat = model.start_chat(history=history)
             response = chat.send_message(prompt_text)
+            
+            # 如果成功，記錄這個模型名稱，下次直接用
+            st.session_state.current_model_name = model_name
             return response.text
 
         except Exception as e:
-            # 4. 降級處理：如果搜尋工具失敗或 429，嘗試「無工具」模式
-            if "429" in str(e) or "quota" in str(e).lower():
-                time.sleep(2) # 稍微緩衝
-                model_backup = genai.GenerativeModel(
-                    model_name='gemini-1.5-flash',
-                    system_instruction=system_instruction,
-                    safety_settings=safety_settings
-                    # 移除 tools 以節省資源
-                )
-                chat_backup = model_backup.start_chat(history=history)
-                response = chat_backup.send_message(prompt_text + "\n(系統提示：因網路繁忙，此回應暫時關閉聯網搜尋功能，僅基於內建知識庫回答)")
-                return response.text
+            error_str = str(e)
+            last_error = error_str
+            # 如果是 429 (配額滿) 或 404 (模型找不到)，就換下一個試試看
+            if "404" in error_str or "not found" in error_str.lower():
+                continue # 換下一個模型名
+            elif "429" in error_str or "quota" in error_str.lower():
+                # 如果是配額滿，嘗試切換到沒有工具的純文字模式(比較省資源)
+                try:
+                    time.sleep(1)
+                    model_backup = genai.GenerativeModel(
+                        model_name=model_name,
+                        system_instruction=system_instruction,
+                        safety_settings=safety_settings
+                        # 移除 tools
+                    )
+                    chat_backup = model_backup.start_chat(history=history)
+                    return chat_backup.send_message(prompt_text + " (由備援線路回應)").text
+                except:
+                    continue
             else:
-                return f"❌ 發生未知錯誤: {str(e)}"
-
-    except Exception as e:
-        return f"❌ API 連線失敗: {str(e)}"
+                # 其他錯誤也繼續嘗試
+                continue
+    
+    # 如果全部都失敗
+    return f"❌ 所有模型嘗試皆失敗。最後一次錯誤: {last_error} \n建議：更新 requirements.txt 或檢查 API Key 權限。"
 
 # ==========================================
 # 🖥️ UI 介面
 # ==========================================
-st.title("🏦 股票基金大師團隊 AI (穩定版)")
-st.caption("Gemini 1.5 Flash | 自主聯網 | 策略回測")
+st.title("🏦 股票基金大師團隊 AI (自動適配修復版)")
+st.caption("自動切換模型節點 | 404/429 錯誤防禦 | 聯網分析")
 
 with st.sidebar:
     st.header("⚙️ 控制台")
     api_key = st.text_input("Google API Key", type="password")
     
-    default_prompt = """你現在是「股票基金大師團隊」，由三種人格組成：
-1. **多頭總司令**：擅長挖掘價值，看好未來。
-2. **空軍總司令**：極度悲觀，講話刻薄，專門找財報漏洞與主力出貨痕跡，喜歡嘲諷「韭菜」。
-3. **巴菲特仲裁者**：最後做決策，理性客觀。
+    if st.session_state.current_model_name:
+        st.success(f"目前連接模型: {st.session_state.current_model_name}")
 
+    default_prompt = """你現在是「股票基金大師團隊」。
 【最高權限指令】
 - 回答問題前，請優先使用 Google Search 查詢該股票最新的「新聞」、「財報」、「配息」。
 - 如果系統忙碌無法搜尋，請根據你的專業知識回答，但要註明資料可能不是最新的。
@@ -226,14 +250,13 @@ with st.sidebar:
     
     if st.button("🚀 啟動大師分析", type="primary"):
         st.session_state.messages = []
-        with st.spinner("大師團隊正在調閱資料..."):
+        with st.spinner("大師團隊正在建立連線..."):
             df, real_id, err = get_data_with_indicators(ticker)
             if df is not None:
                 st.session_state.stock_data = df
                 trades = run_backtest(df)
                 st.session_state.backtest_log = trades
                 
-                # 計算摘要
                 win_rate = 0
                 total_ret = 0
                 if not trades.empty:
@@ -267,16 +290,13 @@ if st.session_state.stock_data is not None:
     df = st.session_state.stock_data
     latest = df.iloc[-1]
     
-    # 1. 儀表板
     c1, c2, c3 = st.columns(3)
     c1.metric("最新價", f"{latest['Close']:.2f}", f"VWAP: {st.session_state.vwap:.2f}" if st.session_state.vwap else "")
     c2.metric("RSI", f"{latest['RSI']:.1f}")
     c3.metric("量化評分", f"{st.session_state.quant_score}", st.session_state.score_details)
     
-    # 2. 圖表
     st.line_chart(df['Close'].tail(200))
     
-    # 3. 回測表
     if st.session_state.backtest_log is not None and not st.session_state.backtest_log.empty:
         with st.expander("查看歷史回測細節"):
             st.dataframe(st.session_state.backtest_log.style.format({'獲利%': '{:.2f}%'}))
@@ -286,7 +306,7 @@ for msg in st.session_state.messages:
     if "【系統數據】" not in msg["content"]:
         with st.chat_message(msg["role"]): st.markdown(msg["content"])
 
-if user_input := st.chat_input("問問大師團隊 (例如：最近外資在賣什麼？)..."):
+if user_input := st.chat_input("問問大師團隊..."):
     if not api_key: st.error("請輸入 API Key")
     else:
         st.chat_message("user").markdown(user_input)
