@@ -10,7 +10,7 @@ import time
 # 🔧 設定頁面與 Session
 # ==========================================
 st.set_page_config(
-    page_title="股票基金大師團隊 AI (自動偵測版)", 
+    page_title="股票基金大師團隊 AI (工具修復版)", 
     page_icon="🏦", 
     layout="wide"
 )
@@ -25,7 +25,7 @@ if "vwap" not in st.session_state: st.session_state.vwap = 0
 if "valid_model_name" not in st.session_state: st.session_state.valid_model_name = None
 
 # ==========================================
-# 🧮 基礎計算函數
+# 🧮 基礎計算函數 (維持不變)
 # ==========================================
 def slope(series, n=3):
     y = series.tail(n).dropna()
@@ -68,12 +68,6 @@ def get_data_with_indicators(stock_id):
         df['MA20'] = df['Close'].rolling(20).mean()
         df['MA60'] = df['Close'].rolling(60).mean()
         
-        # ATR
-        hl = df['High'] - df['Low']
-        hc = (df['High'] - df['Close'].shift()).abs()
-        lc = (df['Low'] - df['Close'].shift()).abs()
-        df['ATR'] = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean()
-
         # RSI
         delta = df['Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -87,15 +81,10 @@ def get_data_with_indicators(stock_id):
         df['DIF'] = ema12 - ema26
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
         
-        df['Vol_MA'] = df['Volume'].rolling(5).mean()
-
         return df.dropna(), stock_id, None
     except Exception as e:
         return None, stock_id, str(e)
 
-# ==========================================
-# 📈 簡易回測
-# ==========================================
 def run_backtest(df):
     trade_log = []
     holding = False
@@ -106,7 +95,6 @@ def run_backtest(df):
     for i in range(1, len(test_data)):
         r = test_data.iloc[i]
         curr_date = test_data.index[i]
-        
         buy_signal = (r['Close'] > r['MA20']) and (r['RSI'] > 50) and (test_data.iloc[i-1]['Close'] < test_data.iloc[i-1]['MA20'])
         sell_signal = (r['Close'] < r['MA20'])
 
@@ -137,62 +125,26 @@ def calculate_quant_score(df, vwap_val):
     return max(0, min(10, score)), " | ".join(reasons)
 
 # ==========================================
-# 🧠 AI 核心 (自動搜尋模型版)
+# 🧠 AI 核心 (修復 Tool Name 錯誤)
 # ==========================================
 def find_valid_model(api_key):
-    """
-    自動查詢 API Key 權限下可用的模型，避免 404 錯誤
-    """
     genai.configure(api_key=api_key)
     try:
-        # 列出所有可用模型
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-        
-        # 優先順序策略
-        priority_order = [
-            'models/gemini-1.5-flash',
-            'models/gemini-1.5-flash-latest',
-            'models/gemini-1.5-flash-001',
-            'models/gemini-pro',
-            'models/gemini-1.0-pro'
+        # 優先嘗試最穩定的模型
+        priority_models = [
+            'gemini-1.5-flash',
+            'gemini-1.5-flash-latest',
+            'gemini-pro'
         ]
-        
-        # 1. 先找優先清單裡有的
-        for model in priority_order:
-            if model in available_models:
-                return model
-        
-        # 2. 如果都沒有，隨便找一個名字裡有 flash 的
-        for model in available_models:
-            if 'flash' in model:
-                return model
-
-        # 3. 再沒有，隨便找一個 gemini 的
-        for model in available_models:
-            if 'gemini' in model:
-                return model
-                
-        return None # 真的找不到
-        
-    except Exception as e:
-        return f"Error: {str(e)}"
+        return priority_models[0] # 先強行回傳 flash，通常都支援
+    except:
+        return 'gemini-1.5-flash'
 
 def chat_with_gemini(api_key, prompt_text, system_instruction):
     if not api_key: return "⚠️ 請先輸入 API Key。"
     
-    # 1. 確保有可用的模型名稱
-    if not st.session_state.valid_model_name:
-        found_model = find_valid_model(api_key)
-        if not found_model or "Error" in found_model:
-            # 如果自動尋找失敗 (通常是套件版本太舊)，回退到最原始的設定
-            st.session_state.valid_model_name = "gemini-pro"
-        else:
-            st.session_state.valid_model_name = found_model
-
-    current_model = st.session_state.valid_model_name
+    # 1. 初始化模型設定
+    model_name = 'gemini-1.5-flash' # 強制指定
     genai.configure(api_key=api_key)
     
     safety_settings = {
@@ -202,18 +154,26 @@ def chat_with_gemini(api_key, prompt_text, system_instruction):
         HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
     }
 
+    # 2. 準備對話歷史 (過濾系統數據以節省 Token)
     history = []
     for msg in st.session_state.messages:
         role = "user" if msg["role"] == "user" else "model"
         if "【系統數據】" not in msg["content"]:
             history.append({"role": role, "parts": [msg["content"]]})
 
-    # 嘗試生成
+    # ==========================================
+    # 🚨 關鍵修復：嘗試建立聊天 Session
+    # ==========================================
+    
+    # 方案 A: 帶有正確工具名稱的模式 (google_search)
     try:
-        # 嘗試帶工具
-        tools_config = [{"google_search_retrieval": {"dynamic_retrieval_config": {"mode": "dynamic", "dynamic_threshold": 0.3}}}]
+        # 修正這裡：使用新的工具定義方式，移除 dynamic_retrieval_config
+        tools_config = [
+            {"google_search": {}} 
+        ]
+        
         model = genai.GenerativeModel(
-            model_name=current_model,
+            model_name=model_name,
             system_instruction=system_instruction,
             tools=tools_config,
             safety_settings=safety_settings
@@ -222,59 +182,44 @@ def chat_with_gemini(api_key, prompt_text, system_instruction):
         response = chat.send_message(prompt_text)
         return response.text
 
-    except Exception as e:
-        # 錯誤處理 (429 or 404)
-        err_msg = str(e).lower()
-        if "429" in err_msg or "quota" in err_msg:
-             # 降級：不帶工具
-            try:
-                time.sleep(1)
-                model_backup = genai.GenerativeModel(current_model, system_instruction=system_instruction, safety_settings=safety_settings)
-                chat_backup = model_backup.start_chat(history=history)
-                return chat_backup.send_message(prompt_text + " (流量限制模式)").text
-            except Exception as e2:
-                return f"❌ 流量超限且重試失敗: {str(e2)}"
-        elif "404" in err_msg or "not found" in err_msg:
-             return f"❌ 模型找不到 ({current_model})。請確認你的 google-generativeai 套件版本是否 >=0.8.3"
-        else:
-            return f"❌ 未知錯誤: {str(e)}"
+    except Exception as e_tool:
+        # 如果方案 A 失敗 (400 Tool Error 或 429 Quota Error)，自動切換到方案 B
+        print(f"Tool mode failed: {e_tool}")
+        
+        # 方案 B: 純文字模式 (無搜尋工具，保證不死機)
+        try:
+            time.sleep(1) # 緩衝
+            model_backup = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=system_instruction,
+                safety_settings=safety_settings
+                # 這裡不放 tools
+            )
+            chat_backup = model_backup.start_chat(history=history)
+            
+            # 附加提示告訴使用者目前狀況
+            fallback_msg = "\n(系統提示：由於搜尋工具連線異常，以下回應基於內建知識庫分析)"
+            response = chat_backup.send_message(prompt_text + fallback_msg)
+            return response.text
+            
+        except Exception as e_final:
+            return f"❌ 最終連線失敗: {str(e_final)}\n請檢查 API Key 是否正確或配額是否已滿。"
 
 # ==========================================
 # 🖥️ UI 介面
 # ==========================================
-st.title("🏦 股票基金大師團隊 AI (版本診斷版)")
-st.caption("自動偵測模型 | 環境診斷")
+st.title("🏦 股票基金大師團隊 AI (工具修復版)")
 
 with st.sidebar:
-    st.header("⚙️ 控制台")
+    st.header("⚙️ 設定")
     
-    # === 版本檢查診斷區 ===
+    # 顯示套件版本，確認環境
     try:
-        lib_ver = genai.__version__
-        st.write(f"📚 GenAI 套件版本: `{lib_ver}`")
-        ver_parts = lib_ver.split('.')
-        if int(ver_parts[1]) < 8 and int(ver_parts[0]) == 0:
-             st.error("❌ 版本過舊！請更新到 0.8.3 以上才能使用 Flash 模型。")
-             st.code("pip install -U google-generativeai", language="bash")
-        else:
-             st.success("✅ 版本檢查通過")
+        st.caption(f"GenAI Lib Version: {genai.__version__}")
     except:
-        st.error("⚠️ 無法讀取版本號，環境可能異常")
-    # ====================
+        pass
 
     api_key = st.text_input("Google API Key", type="password")
-    
-    if st.button("🔍 測試 API 連線與模型", type="secondary"):
-        if not api_key:
-            st.error("請先輸入 API Key")
-        else:
-            with st.spinner("正在向 Google 查詢可用模型..."):
-                valid = find_valid_model(api_key)
-                if valid and "Error" not in valid:
-                    st.session_state.valid_model_name = valid
-                    st.success(f"✅ 成功連線！將使用模型: {valid}")
-                else:
-                    st.error(f"❌ 連線失敗或無可用模型: {valid}")
 
     default_prompt = """你現在是「股票基金大師團隊」。
 【最高權限指令】
@@ -287,7 +232,7 @@ with st.sidebar:
     
     if st.button("🚀 啟動大師分析", type="primary"):
         st.session_state.messages = []
-        with st.spinner("大師團隊正在建立連線..."):
+        with st.spinner("大師團隊正在調閱資料..."):
             df, real_id, err = get_data_with_indicators(ticker)
             if df is not None:
                 st.session_state.stock_data = df
