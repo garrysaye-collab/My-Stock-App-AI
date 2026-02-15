@@ -2,5 +2,5 @@ streamlit
 pandas
 yfinance
 numpy
-google-generativeai
 duckduckgo-search>=5.0.0
+google-generativeai>=0.7.0
