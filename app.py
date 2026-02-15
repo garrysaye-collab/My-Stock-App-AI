@@ -3,14 +3,14 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 import google.generativeai as genai
-from duckduckgo_search import DDGS
+import datetime
 
 # ==========================================
 # 🔧 系統設定與狀態初始化
 # ==========================================
 st.set_page_config(page_title="專業量化與 AI 經理人戰情室", page_icon="🏦", layout="wide")
 
-# 初始化 Session State (讓資料在對話時不會消失)
+# 初始化 Session State
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "data_context" not in st.session_state:
@@ -50,7 +50,7 @@ def detailed_scoring(df):
     rsi_slope = slope(df['RSI'], 3)
     vwap_approx = (r['High'] + r['Low'] + r['Close']) / 3
 
-    # 評分邏輯 (簡潔版，保持邏輯不變)
+    # 評分邏輯
     checks = [
         (r['MA5'] > r['MA10'] > r['MA20'], 3, "均線多頭排列", "MA5>MA10>MA20"),
         (macd_slope > 0 and r['OSC'] > 0, 2, "MACD 轉強", "DIF斜率>0, OSC>0"),
@@ -102,20 +102,58 @@ def comprehensive_backtest(df):
     return pd.DataFrame(log)
 
 def get_ai_response(api_key, messages_history):
-    """處理對話請求"""
+    """
+    處理對話請求：啟用 Google Search Grounding 與 動態時間注入
+    """
     genai.configure(api_key=api_key)
+    
+    # 1. 獲取精確的當前時間，強制對齊時間軸
+    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # 2. 定義系統指令 (System Instruction) - 強制聯網與角色扮演
+    sys_instruction = f"""
+    現在時間是：{current_time}。
+    你是【全能基金經理人團隊】，包含：
+    1. 總經分析師 (關注宏觀、利率、地緣政治)
+    2. 暗黑操盤手 (關注籌碼、騙線、養套殺)
+    3. 巴菲特 (關注護城河、現金流、價值)
+
+    【最高指令】：
+    - 你擁有 Google Search 工具。針對用戶的每個問題，必須**優先使用工具**查閱該股票的「最新股價」、「最新新聞 (24小時內)」與「最新財報」。
+    - **嚴禁**使用你訓練資料中的舊數據來回答關於「現價」、「本益比」或「近期趨勢」的問題。
+    - 如果回測數據 (用戶提供) 與即時新聞 (你搜尋到的) 衝突，以**即時新聞**為準，並指出市場是否發生了結構性改變。
+    - 回答風格：激烈辯證，數據說話，最後由巴菲特給出結論。
+    """
+
     try:
-        model = genai.GenerativeModel("models/gemini-2.5-flash")
-        # 將對話歷史轉換為 Gemini 格式
+        # 3. 初始化模型時啟用 Search 工具 (建議使用 gemini-1.5-pro 以獲得最佳搜尋推理能力)
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-pro", 
+            tools='google_search_retrieval', 
+            system_instruction=sys_instruction
+        )
+
+        # 4. 轉換對話歷史
         gemini_hist = []
         for m in messages_history:
             role = "user" if m["role"] == "user" else "model"
-            gemini_hist.append({"role": role, "parts": [m["content"]]})
+            gemini_hist.append({"role": role, "parts": [str(m["content"])]})
             
+        # 5. 生成回應 (啟用自動搜尋)
         response = model.generate_content(gemini_hist)
-        return response.text
+        
+        # 6. 解析回應 (包含搜尋來源引用)
+        final_text = response.text
+        
+        # 檢查是否有 Grounding Metadata (搜尋來源)
+        if response.candidates[0].grounding_metadata.search_entry_point:
+            search_html = response.candidates[0].grounding_metadata.search_entry_point.rendered_content
+            final_text += "\n\n" + "🔍 **資料來源與即時驗證：**\n" + search_html
+        
+        return final_text
+
     except Exception as e:
-        return f"AI 經理人連線錯誤: {str(e)}"
+        return f"AI 經理人連線或搜尋錯誤: {str(e)}\n(請確認 API Key 是否有效，並支援 Google Search Grounding)"
 
 # ==========================================
 # 🖥️ UI 介面與主邏輯
@@ -152,35 +190,27 @@ if run_btn and api_key:
             score, score_details = detailed_scoring(df)
             bt_log = comprehensive_backtest(df)
             
-            # 聯網搜尋
-            try:
-                with DDGS() as ddgs:
-                    news = list(ddgs.text(f"{full_name} {real_symbol} 股息 PE 財報 新聞 2026", max_results=5))
-                news_text = "\n".join([f"- {n['title']}: {n['body']}" for n in news])
-            except:
-                news_text = "聯網搜尋失敗，請依據現有技術面回答。"
-
-            # 構建初始 System Prompt
-            system_prompt = f"""
-            你是一群專業投資經理人團隊 (總經分析、暗黑操盤手、巴菲特)。
+            # --- 重點修改：這裡不再使用 DDGS，而是準備純數據給 AI ---
+            
+            # 構建初始 Prompt (只提供技術面數據，要求 AI 自己去查基本面)
+            initial_data_prompt = f"""
+            【量化技術面數據輸入】
             標的：{full_name} ({real_symbol})
             
-            【最新量化得分】：{score}分
-            {score_details.to_string()}
+            【技術面診斷】：
+            - 核心動能得分：{score}/10
+            - 詳細指標狀態：\n{score_details.to_string()}
             
-            【歷史回測統計】：
-            總交易: {len(bt_log)} 次
-            勝率: {(len(bt_log[bt_log['獲利%']>0])/len(bt_log)*100) if not bt_log.empty else 0:.1f}%
-            累計報酬: {bt_log['獲利%'].sum() if not bt_log.empty else 0:.1f}%
+            【歷史回測統計 (過去2年)】：
+            - 總交易次數: {len(bt_log)} 次
+            - 策略勝率: {(len(bt_log[bt_log['獲利%']>0])/len(bt_log)*100) if not bt_log.empty else 0:.1f}%
+            - 累計報酬: {bt_log['獲利%'].sum() if not bt_log.empty else 0:.1f}%
             
-            【即時聯網情報】：
-            {news_text}
-            
-            請根據以上數據，給出第一份詳盡的辯證報告。
+            請根據上述「技術與量化數據」，並立刻使用你的 Google Search 工具查詢該公司的「最新財報」、「除權息消息」與「產業新聞」，開始第一輪的多空辯證分析。
             """
 
-            # 呼叫 AI 產生第一份報告
-            initial_response = get_ai_response(api_key, [{"role": "user", "content": system_prompt}])
+            # 呼叫 AI 產生第一份報告 (AI 會在這裡觸發搜尋)
+            initial_response = get_ai_response(api_key, [{"role": "user", "content": initial_data_prompt}])
             
             # === 將數據存入 Session State ===
             st.session_state.data_context = {
@@ -192,9 +222,9 @@ if run_btn and api_key:
                 "bt_log": bt_log
             }
             
-            # 更新對話紀錄 (只保留 System Prompt 概念作為背景，不顯示給用戶看，直接顯示 AI 回答)
+            # 更新對話紀錄
             st.session_state.messages = [
-                {"role": "user", "content": system_prompt}, # 這一條隱藏的 context
+                {"role": "user", "content": initial_data_prompt}, 
                 {"role": "assistant", "content": initial_response}
             ]
         else:
@@ -228,10 +258,10 @@ if st.session_state.data_context:
     # --- 3. 對話區域 (Chat Interface) ---
     st.subheader("💬 與經理人團隊對話")
     
-    # 顯示歷史訊息 (排除第一條 User System Prompt，因為太長且是用戶看不懂的 raw data)
+    # 顯示歷史訊息 (排除第一條 User System Prompt)
     for msg in st.session_state.messages:
-        if msg == st.session_state.messages[0] and "你是一群專業投資經理人團隊" in msg['content']:
-            continue # 跳過系統預設的第一條 Prompt 顯示
+        if msg == st.session_state.messages[0] and "【量化技術面數據輸入】" in str(msg['content']):
+            continue 
         
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -247,8 +277,8 @@ if st.session_state.data_context:
             # 2. 加入歷史紀錄
             st.session_state.messages.append({"role": "user", "content": prompt})
             
-            # 3. 呼叫 AI 回答
-            with st.spinner("經理人團隊討論中..."):
+            # 3. 呼叫 AI 回答 (這裡也會觸發 Google Search)
+            with st.spinner("經理人團隊討論中 (正在聯網檢索)..."):
                 response = get_ai_response(api_key, st.session_state.messages)
             
             # 4. 顯示 AI 回答
